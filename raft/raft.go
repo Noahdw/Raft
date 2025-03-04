@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/rpc"
 	"sync"
 	"time"
@@ -47,7 +48,6 @@ type logEntry struct {
 
 type State struct {
 	electionState ElectionState
-	heartbeat     time.Duration
 	electionReset chan bool
 
 	// Persistent state on all servers
@@ -80,45 +80,40 @@ func (r *raft) Start() {
 
 type raft struct {
 	state      State
-	rpcClient  []*rpc.Client
+	ownAdress  string
 	numOfPeers int
+	rpcClients []*rpc.Client
 }
 
 type RaftConfig struct {
-	// index into raftAddresses this node belongs to
-	raftId int
-	// addresses for raft, including own
-	raftAddresses []string
+	peerAddresses []string
+	ownAdress     string
 }
 
 func NewRaft(config RaftConfig) *raft {
-	clients := createRpcClients(&config.raftAddresses, config.raftId)
+	clients := createRpcClients(&config.peerAddresses)
 	numOfPeers := len(clients)
 
 	state := State{
 		electionState: Follower,
-		heartbeat:     time.Duration(150) * time.Millisecond,
-		id:            config.raftId,
 		nextindex:     make([]int, numOfPeers),
 		matchindex:    make([]int, numOfPeers),
 	}
 
 	r := raft{
 		state:      state,
-		rpcClient:  clients,
+		rpcClients: clients,
 		numOfPeers: numOfPeers,
+		ownAdress:  config.ownAdress,
 	}
 	return &r
 }
 
-func createRpcClients(raftAddresses *[]string, ownId int) []*rpc.Client {
-	numPeers := len(*raftAddresses) - 1
+func createRpcClients(raftAddresses *[]string) []*rpc.Client {
+	numPeers := len(*raftAddresses)
 	clients := make([]*rpc.Client, numPeers)
 	index := 0
-	for i, addr := range *raftAddresses {
-		if i == ownId {
-			continue
-		}
+	for _, addr := range *raftAddresses {
 		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
 			// FIXME do more
@@ -129,25 +124,6 @@ func createRpcClients(raftAddresses *[]string, ownId int) []*rpc.Client {
 		index++
 	}
 	return clients
-}
-
-func (r *raft) TryCommand(command interface{}) {
-	if r.state.electionState == Leader {
-		entry := logEntry{
-			term:     r.state.currentTerm,
-			command:  command,
-			logIndex: len(r.state.log.entries),
-		}
-		r.state.log.entries = append(r.state.log.entries, entry)
-		r.requestAppendEntries(
-			r.state.currentTerm,
-			r.state.id,
-			r.state.log.lastIndex(),
-			r.state.log.lastTerm(),
-			r.state.commitIndex,
-			[]logEntry{entry},
-		)
-	}
 }
 
 type appendEntriesArgs struct {
@@ -162,112 +138,6 @@ type appendEntriesArgs struct {
 type appendEntriesReply struct {
 	term    int
 	success bool
-}
-
-// FIXME: Current code assumes sequential command processing. Make async
-func (r *raft) requestAppendEntries(
-	leaderTerm int,
-	leaderId int,
-	prevLogIndex int,
-	prevLogTerm int,
-	leaderCommit int,
-	entries []logEntry) {
-
-	var wg sync.WaitGroup
-	ch := make(chan appendEntriesReply, r.numOfPeers)
-	wg.Add(r.numOfPeers)
-
-	for i := 0; i < r.numOfPeers; i++ {
-		go func(index int, curTerm int) {
-			defer wg.Done()
-
-			args := appendEntriesArgs{
-				leaderTerm:   leaderTerm,
-				leaderId:     leaderId,
-				prevLogIndex: prevLogIndex,
-				prevLogTerm:  prevLogTerm,
-				leaderCommit: leaderCommit,
-				entries:      entries,
-			}
-
-			reply := appendEntriesReply{
-				term:    0,
-				success: false,
-			}
-			for {
-				err := r.rpcClient[i].Call("appendEntries", args, &reply)
-				if err != nil {
-					fmt.Printf("appendEntries error %s", err.Error())
-				}
-				if reply.success || reply.term > curTerm {
-					break
-				}
-				r.state.nextindex[i] -= 1
-				args.prevLogIndex = r.state.nextindex[i]
-				args.entries = r.state.log.entries[r.state.nextindex[i]:]
-			}
-
-			ch <- reply
-		}(i, r.state.currentTerm)
-	}
-
-	wg.Wait()
-
-	for i := 0; i < r.numOfPeers; i++ {
-		reply := <-ch
-		if reply.term > r.state.currentTerm {
-			// Found a higher term. Leader no more, become follower.
-			r.state.currentTerm = reply.term
-			r.state.electionState = Follower
-		}
-	}
-}
-
-func (r *raft) appendEntries(args *appendEntriesArgs, reply *appendEntriesReply) error {
-	reply.term = r.state.currentTerm
-
-	// Stale leader
-	if args.leaderTerm < r.state.currentTerm {
-		reply.success = false
-		return nil
-	}
-
-	r.state.electionReset <- true
-	r.state.electionState = Follower
-
-	// Not in line with leader at previous entries
-	// Leader will retry with index-1
-	if !r.state.log.termAtIndexMatches(args.prevLogIndex, args.prevLogTerm) {
-		r.persistState()
-		reply.success = false
-		return nil
-	}
-
-	// If we get here, we know args.prevLogIndex is the last known good
-	// location for our log. We might have extras though that are not good.
-
-	// If there are existing entries that do not match the term of the new entries,
-	// delete all existing entries after the first bad one
-	curLastIndex := r.state.log.lastIndex()
-	amountToCheck := min(len(args.entries), curLastIndex-args.prevLogIndex)
-	for i := 0; i < amountToCheck; i++ {
-		checkIndex := args.prevLogIndex + i + 1
-		newEntryTerm := args.entries[i]
-		curEntryTerm := r.state.log.entries[checkIndex]
-		if newEntryTerm != curEntryTerm {
-			r.state.log.entries = r.state.log.entries[:checkIndex]
-			r.state.log.entries = append(r.state.log.entries, args.entries[i:]...)
-			break
-		}
-
-	}
-
-	if args.leaderCommit > r.state.commitIndex {
-		r.state.commitIndex = min(args.leaderCommit, r.state.log.lastIndex())
-	}
-	r.persistState()
-	reply.success = true
-	return nil
 }
 
 type requestVoteArgs struct {
@@ -308,7 +178,7 @@ func (r *raft) requestRequestVote(term int, candidateId int, lastLogIndex int, l
 				voteGranted: false,
 			}
 			// FIXME - need rpc timeout
-			err := r.rpcClient[index].Call("requestVote", args, &reply)
+			err := r.rpcClients[index].Call("Raft.RequestVote", args, &reply)
 			if err != nil {
 				fmt.Printf("requestVote error %s", err.Error())
 				return
@@ -385,66 +255,360 @@ func (r *raft) requestVote(args *requestVoteArgs, reply *requestVoteReply) error
 func (r *raft) persistState() {
 
 }
-func (r *raft) ticker() {
-	heartbeatTicker := time.NewTicker(r.state.heartbeat)
-	electionTicker := time.NewTicker(getRandElectionTimeout())
-	for {
-		select {
-		// Attempt to become leader
-		case <-electionTicker.C:
-			r.handleElectionTimeout()
-		// Leader checks if other nodes are still available
-		case <-heartbeatTicker.C:
-			if r.state.electionState == Leader {
-				r.sendHeatbeats()
-			}
-		case <-r.state.electionReset:
-			electionTicker.Reset(getRandElectionTimeout())
-		}
-	}
-}
 
 func (r *raft) serveRaft() {
+	// Create the RPC server
+	rpcServer := rpc.NewServer()
 
+	// Register the RPC handlers
+	rpcHandler := &RaftRPC{raft: r}
+	err := rpcServer.RegisterName("Raft", rpcHandler)
+	if err != nil {
+		fmt.Printf("Error registering RPC handlers: %v\n", err)
+		return
+	}
+
+	// Listen for connections
+	listener, err := net.Listen("tcp", r.ownAdress)
+	if err != nil {
+		fmt.Printf("Error starting RPC listener: %v\n", err)
+		return
+	}
+
+	// Serve connections
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Printf("Error accepting connection: %v\n", err)
+			continue
+		}
+		go rpcServer.ServeConn(conn)
+	}
 }
 
-func (r *raft) handleElectionTimeout() {
-	if (r.state.electionState == Follower && r.state.votedFor == 0) ||
-		r.state.electionState == Candidate {
+type runnable interface {
+	// Returns the state to transition into after run returns
+	run() ElectionState
+	// Stops the entity in order to transition into the election state
+	stop(ElectionState)
 
-		r.state.currentTerm += 1      // Begin new election term
-		r.state.votedFor = r.state.id // vote for self
-		r.state.electionState = Candidate
-		r.persistState()
-		votes := r.requestRequestVote(
-			r.state.currentTerm,
-			r.state.id,
-			r.state.lastApplied,
-			r.state.log.lastTerm(),
-		)
-		if votes > r.numOfPeers/2-1 {
-			// Election won, become leader
-			r.state.electionState = Leader
-			r.persistState()
-			for i := range r.state.nextindex {
-				r.state.nextindex[i] = r.state.log.lastIndex() + 1
+	electionState() ElectionState
+}
+
+// The world in which raft takes place
+type world struct {
+	raft   *raft
+	entity runnable
+}
+
+func NewWorld() *world {
+	return &world{
+		entity: &follower{},
+	}
+}
+
+func (w *world) start() {
+
+	for {
+		// Run is blocking
+		newElectionState := w.entity.run()
+
+		switch newElectionState {
+		case Follower:
+			w.entity = &follower{
+				raft: &raft{},
+				exit: make(chan ElectionState),
 			}
-			r.sendHeatbeats()
+		case Candidate:
+			w.entity = &candiate{
+				raft: &raft{},
+				exit: make(chan ElectionState),
+			}
+		case Leader:
+			w.entity = &leader{
+				raft: &raft{},
+				exit: make(chan ElectionState),
+			}
 		}
 	}
+}
+
+func (w *world) RequestVote(args *requestVoteArgs, reply *requestVoteReply) error {
+	return w.raft.requestVote(args, reply)
+}
+
+func (w *world) AppendEntries(args *appendEntriesArgs, reply *appendEntriesReply) error {
+	// TODO: Do some more before transitioning.
+	if w.entity.electionState() != Follower {
+		w.entity.stop(Follower)
+	}
+	follower := w.entity.(*follower)
+	return follower.appendEntries(args, reply)
+}
+
+// ========== LEADER ================
+type leader struct {
+	raft      *raft
+	heartbeat time.Duration
+	exit      chan ElectionState
+}
+
+func (l *leader) run() ElectionState {
+	heartbeatTicker := time.NewTicker(time.Duration(150) * time.Millisecond)
+
+	for {
+		select {
+		case <-heartbeatTicker.C:
+			l.sendHeatbeats()
+		case state := <-l.exit:
+			return state
+		}
+	}
+}
+
+func (c *leader) stop(state ElectionState) {
+	c.exit <- state
 }
 
 // Send empty entries as a heartbeat,
 // clients reset their election timeout on heartbeat
-func (r *raft) sendHeatbeats() {
-
-	r.requestAppendEntries(
-		r.state.currentTerm,
-		r.state.id,
-		r.state.log.lastIndex(),
-		r.state.log.lastTerm(),
-		r.state.commitIndex,
+func (l *leader) sendHeatbeats() {
+	l.requestAppendEntries(
+		l.raft.state.currentTerm,
+		l.raft.state.id,
+		l.raft.state.log.lastIndex(),
+		l.raft.state.log.lastTerm(),
+		l.raft.state.commitIndex,
 		[]logEntry{})
+}
+
+// FIXME: Current code assumes sequential command processing. Make async
+func (l *leader) requestAppendEntries(
+	leaderTerm int,
+	leaderId int,
+	prevLogIndex int,
+	prevLogTerm int,
+	leaderCommit int,
+	entries []logEntry) {
+
+	var wg sync.WaitGroup
+	ch := make(chan appendEntriesReply, l.raft.numOfPeers)
+	wg.Add(l.raft.numOfPeers)
+
+	for i := range l.raft.numOfPeers {
+		go func(index int, curTerm int) {
+			defer wg.Done()
+
+			args := appendEntriesArgs{
+				leaderTerm:   leaderTerm,
+				leaderId:     leaderId,
+				prevLogIndex: prevLogIndex,
+				prevLogTerm:  prevLogTerm,
+				leaderCommit: leaderCommit,
+				entries:      entries,
+			}
+
+			reply := appendEntriesReply{
+				term:    0,
+				success: false,
+			}
+
+			for {
+				err := l.raft.rpcClients[i].Call("Raft.AppendEntries", args, &reply)
+				if err != nil {
+					fmt.Printf("appendEntries error %s", err.Error())
+				}
+				if reply.success || reply.term > curTerm {
+					break
+				}
+				l.raft.state.nextindex[i] -= 1
+				args.prevLogIndex = l.raft.state.nextindex[i]
+				args.entries = l.raft.state.log.entries[l.raft.state.nextindex[i]:]
+			}
+
+			ch <- reply
+		}(i, l.raft.state.currentTerm)
+	}
+
+	wg.Wait()
+
+	for range l.raft.numOfPeers {
+		reply := <-ch
+		if reply.term > l.raft.state.currentTerm {
+			// Found a higher term. Leader no more, become follower.
+			l.raft.state.currentTerm = reply.term
+			l.raft.state.electionState = Follower
+		}
+	}
+}
+
+func (l *leader) TryCommand(command interface{}) {
+	entry := logEntry{
+		term:     l.raft.state.currentTerm,
+		command:  command,
+		logIndex: len(l.raft.state.log.entries),
+	}
+	l.raft.state.log.entries = append(l.raft.state.log.entries, entry)
+	l.requestAppendEntries(
+		l.raft.state.currentTerm,
+		l.raft.state.id,
+		l.raft.state.log.lastIndex(),
+		l.raft.state.log.lastTerm(),
+		l.raft.state.commitIndex,
+		[]logEntry{entry},
+	)
+}
+
+func (l *leader) electionState() ElectionState {
+	return Leader
+}
+
+// ========== CANDIDATE ================
+type candiate struct {
+	raft *raft
+	exit chan ElectionState
+}
+
+func (c *candiate) run() ElectionState {
+	electionTicker := time.NewTicker(getRandElectionTimeout())
+	for {
+		select {
+		case <-electionTicker.C:
+			c.attemptBecomeLeader()
+		case state := <-c.exit:
+			return state
+		}
+	}
+}
+
+func (c *candiate) stop(state ElectionState) {
+	c.exit <- state
+}
+
+func (c *candiate) attemptBecomeLeader() {
+	c.raft.state.currentTerm += 1           // Begin new election term
+	c.raft.state.votedFor = c.raft.state.id // vote for self
+	c.raft.state.electionState = Candidate
+	c.raft.persistState()
+	votes := c.raft.requestRequestVote(
+		c.raft.state.currentTerm,
+		c.raft.state.id,
+		c.raft.state.lastApplied,
+		c.raft.state.log.lastTerm(),
+	)
+	if votes > c.raft.numOfPeers/2-1 {
+		// Election won, become leader
+		c.raft.state.electionState = Leader
+		c.raft.persistState()
+		for i := range c.raft.state.nextindex {
+			c.raft.state.nextindex[i] = c.raft.state.log.lastIndex() + 1
+		}
+		c.stop(Leader)
+	}
+}
+
+func (c *candiate) electionState() ElectionState {
+	return Candidate
+}
+
+// ========== FOLLOWER ================
+type follower struct {
+	raft *raft
+	exit chan ElectionState
+}
+
+func (f *follower) run() ElectionState {
+	electionTicker := time.NewTicker(getRandElectionTimeout())
+	for {
+		select {
+		case <-electionTicker.C:
+			f.attemptBecomeLeader()
+		case state := <-f.exit:
+			return state
+		}
+	}
+}
+
+func (f *follower) stop(state ElectionState) {
+	f.exit <- state
+}
+
+func (f *follower) attemptBecomeLeader() {
+	if f.raft.state.votedFor != 0 {
+		return
+	}
+
+	f.raft.state.currentTerm += 1           // Begin new election term
+	f.raft.state.votedFor = f.raft.state.id // vote for self
+	f.raft.state.electionState = Candidate
+	f.raft.persistState()
+	votes := f.raft.requestRequestVote(
+		f.raft.state.currentTerm,
+		f.raft.state.id,
+		f.raft.state.lastApplied,
+		f.raft.state.log.lastTerm(),
+	)
+	if votes > f.raft.numOfPeers/2-1 {
+		// Election won, become leader
+		f.raft.state.electionState = Leader
+		f.raft.persistState()
+		for i := range f.raft.state.nextindex {
+			f.raft.state.nextindex[i] = f.raft.state.log.lastIndex() + 1
+		}
+		//f.raft.sendHeatbeats()
+		f.stop(Leader)
+	}
+}
+
+func (f *follower) appendEntries(args *appendEntriesArgs, reply *appendEntriesReply) error {
+	reply.term = f.raft.state.currentTerm
+
+	// Stale leader
+	if args.leaderTerm < f.raft.state.currentTerm {
+		reply.success = false
+		return nil
+	}
+
+	f.raft.state.electionReset <- true
+	f.raft.state.electionState = Follower
+
+	// Not in line with leader at previous entries
+	// Leader will retry with index-1
+	if !f.raft.state.log.termAtIndexMatches(args.prevLogIndex, args.prevLogTerm) {
+		f.raft.persistState()
+		reply.success = false
+		return nil
+	}
+
+	// If we get here, we know args.prevLogIndex is the last known good
+	// location for our log. We might have extras though that are not good.
+
+	// If there are existing entries that do not match the term of the new entries,
+	// delete all existing entries after the first bad one
+	curLastIndex := f.raft.state.log.lastIndex()
+	amountToCheck := min(len(args.entries), curLastIndex-args.prevLogIndex)
+	for i := 0; i < amountToCheck; i++ {
+		checkIndex := args.prevLogIndex + i + 1
+		newEntryTerm := args.entries[i]
+		curEntryTerm := f.raft.state.log.entries[checkIndex]
+		if newEntryTerm != curEntryTerm {
+			f.raft.state.log.entries = f.raft.state.log.entries[:checkIndex]
+			f.raft.state.log.entries = append(f.raft.state.log.entries, args.entries[i:]...)
+			break
+		}
+
+	}
+
+	if args.leaderCommit > f.raft.state.commitIndex {
+		f.raft.state.commitIndex = min(args.leaderCommit, f.raft.state.log.lastIndex())
+	}
+	f.raft.persistState()
+	reply.success = true
+	return nil
+}
+
+func (f *follower) electionState() ElectionState {
+	return Follower
 }
 
 func getRandElectionTimeout() time.Duration {
