@@ -17,6 +17,15 @@ const (
 	Leader
 )
 
+type electable interface {
+	// Returns the state to transition into after run returns
+	run() <-chan ElectionState
+	// Stops the entity in order to transition into the election state
+	stopAndBecome(ElectionState)
+
+	electionState() ElectionState
+}
+
 type log struct {
 	entries []logEntry
 }
@@ -43,7 +52,7 @@ func (l *log) termAtIndexMatches(index int, termToMatch int) bool {
 type logEntry struct {
 	term     int
 	logIndex int
-	command  interface{}
+	command  any
 }
 
 type State struct {
@@ -70,27 +79,12 @@ type State struct {
 	matchindex []int
 }
 
-func (r *raft) Start() {
-	// Start heartbeat/election tickers
-	go r.ticker()
-
-	// Begin listening for RPC calls from other raft servers
-	go r.serveRaft()
-}
-
-type raft struct {
-	state      State
-	ownAdress  string
-	numOfPeers int
-	rpcClients []*rpc.Client
-}
-
 type RaftConfig struct {
 	peerAddresses []string
 	ownAdress     string
 }
 
-func NewRaft(config RaftConfig) *raft {
+func NewRaft(config RaftConfig) *Raft {
 	clients := createRpcClients(&config.peerAddresses)
 	numOfPeers := len(clients)
 
@@ -100,11 +94,13 @@ func NewRaft(config RaftConfig) *raft {
 		matchindex:    make([]int, numOfPeers),
 	}
 
-	r := raft{
+	r := Raft{
 		state:      state,
 		rpcClients: clients,
 		numOfPeers: numOfPeers,
 		ownAdress:  config.ownAdress,
+		entity:     &follower{},
+		rpcQueued:  make(chan struct{}),
 	}
 	return &r
 }
@@ -152,117 +148,28 @@ type requestVoteReply struct {
 	voteGranted bool
 }
 
-// Called by a candidate to request votes to become leader
-// Initiates the RPC call to requestVote.
-// Returns number of votes granted
-func (r *raft) requestRequestVote(term int, candidateId int, lastLogIndex int, lastLogTerm int) int {
-	args := requestVoteArgs{
-		electionTerm: term,
-		candidateId:  candidateId,
-		lastLogIndex: lastLogIndex,
-		lastLogTerm:  lastLogTerm,
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(r.numOfPeers)
-	ch := make(chan (requestVoteReply), r.numOfPeers)
-	defer close(ch)
-
-	// Send requestVote to all clients
-	// Gather num of votes received
-	for i := 0; i < r.numOfPeers; i++ {
-		go func(index int) {
-			defer wg.Done()
-			reply := requestVoteReply{
-				term:        0,
-				voteGranted: false,
-			}
-			// FIXME - need rpc timeout
-			err := r.rpcClients[index].Call("Raft.RequestVote", args, &reply)
-			if err != nil {
-				fmt.Printf("requestVote error %s", err.Error())
-				return
-			}
-			ch <- reply
-
-		}(i)
-	}
-
-	wg.Wait()
-
-	votes := 0
-	inElection := true
-	for i := 0; i < r.numOfPeers; i++ {
-		reply := <-ch
-		if reply.term > r.state.currentTerm {
-			// Become follower again if behind in term
-			// Continue through all clients in case there is another greater term
-			r.state.currentTerm = reply.term
-			r.state.votedFor = 0
-			r.state.electionState = Follower
-			r.persistState()
-			inElection = false
-		} else if reply.voteGranted {
-			votes += 1
-		}
-	}
-
-	if !inElection {
-		votes = 0
-	}
-
-	return votes
+type Raft struct {
+	state        State
+	ownAdress    string
+	numOfPeers   int
+	rpcClients   []*rpc.Client
+	entity       electable
+	rpcQueued    chan struct{}
+	fnMu         sync.Mutex
+	rpcTaskQueue []*rpcTask
 }
 
-// Received by other nodes to respond to requests to become leader
-// Not called directly. Only called via RPC
-func (r *raft) requestVote(args *requestVoteArgs, reply *requestVoteReply) error {
-	if args.electionTerm < r.state.currentTerm {
-		// If our term is greater than the term of the request, update the requesters term and vote no.
-		reply.term = r.state.currentTerm
-		reply.voteGranted = false
-		return nil
-	}
-
-	reply.term = args.electionTerm
-
-	if args.electionTerm > r.state.currentTerm {
-		r.state.currentTerm = args.electionTerm
-		r.state.votedFor = 0
-		r.state.electionState = Follower
-		r.persistState()
-	}
-
-	newLogUpToDate := false
-	if args.lastLogTerm > r.state.log.lastTerm() {
-		newLogUpToDate = true
-	} else if args.lastLogTerm == r.state.log.lastTerm() &&
-		args.lastLogIndex >= r.state.log.lastIndex() {
-		newLogUpToDate = true
-	}
-
-	// Otherwise grant vote if not yet voted in this term or if already voted for candidate
-	if (r.state.votedFor == 0 || r.state.votedFor == args.candidateId) && newLogUpToDate {
-		r.state.votedFor = args.candidateId
-		r.persistState()
-		reply.voteGranted = true
-	} else {
-		reply.voteGranted = false
-	}
-	return nil
-}
-
-func (r *raft) persistState() {
+func (r *Raft) persistState() {
 
 }
 
-func (r *raft) serveRaft() {
+func (r *Raft) serveRaft() {
 	// Create the RPC server
 	rpcServer := rpc.NewServer()
 
 	// Register the RPC handlers
-	rpcHandler := &RaftRPC{raft: r}
-	err := rpcServer.RegisterName("Raft", rpcHandler)
+
+	err := rpcServer.RegisterName("Raft", r)
 	if err != nil {
 		fmt.Printf("Error registering RPC handlers: %v\n", err)
 		return
@@ -286,87 +193,136 @@ func (r *raft) serveRaft() {
 	}
 }
 
-type runnable interface {
-	// Returns the state to transition into after run returns
-	run() ElectionState
-	// Stops the entity in order to transition into the election state
-	stop(ElectionState)
+// Considered main goroutine
+func (r *Raft) Start() {
 
-	electionState() ElectionState
-}
-
-// The world in which raft takes place
-type world struct {
-	raft   *raft
-	entity runnable
-}
-
-func NewWorld() *world {
-	return &world{
-		entity: &follower{},
-	}
-}
-
-func (w *world) start() {
+	go r.serveRaft()
 
 	for {
-		// Run is blocking
-		newElectionState := w.entity.run()
-
-		switch newElectionState {
-		case Follower:
-			w.entity = &follower{
-				raft: &raft{},
-				exit: make(chan ElectionState),
-			}
-		case Candidate:
-			w.entity = &candiate{
-				raft: &raft{},
-				exit: make(chan ElectionState),
-			}
-		case Leader:
-			w.entity = &leader{
-				raft: &raft{},
-				exit: make(chan ElectionState),
+		select {
+		case <-r.rpcQueued:
+			r.processQueuedRPC()
+		case newElectionState := <-r.entity.run():
+			switch newElectionState {
+			case Follower:
+				r.entity = &follower{
+					raft: r,
+					exit: make(chan ElectionState),
+				}
+			case Candidate:
+				r.entity = &candiate{
+					raft: r,
+					exit: make(chan ElectionState),
+				}
+			case Leader:
+				r.entity = &leader{
+					raft: r,
+					exit: make(chan ElectionState),
+				}
 			}
 		}
+
 	}
 }
 
-func (w *world) RequestVote(args *requestVoteArgs, reply *requestVoteReply) error {
-	return w.raft.requestVote(args, reply)
+func (r *Raft) processQueuedRPC() {
+	r.fnMu.Lock()
+	defer r.fnMu.Unlock()
+
+	task := r.rpcTaskQueue[0]
+	err := task.fn()
+	task.fnResult <- err
 }
 
-func (w *world) AppendEntries(args *appendEntriesArgs, reply *appendEntriesReply) error {
-	// TODO: Do some more before transitioning.
-	if w.entity.electionState() != Follower {
-		w.entity.stop(Follower)
+// Either a RequestVote or AppendEntries
+type rpcTask struct {
+	fn       func() error
+	fnResult chan error
+}
+
+func (r *Raft) queueFunc(fn func() error) *rpcTask {
+	r.fnMu.Lock()
+	defer r.fnMu.Unlock()
+	task := &rpcTask{
+		fn:       fn,
+		fnResult: make(chan error),
 	}
-	follower := w.entity.(*follower)
+	r.rpcTaskQueue = append(r.rpcTaskQueue, task)
+	r.rpcQueued <- struct{}{}
+	return task
+}
+
+// Called via RPC
+// We are in rpc goroutine
+func (r *Raft) RequestVote(args *requestVoteArgs, reply *requestVoteReply) error {
+	// Queue this onto the main goroutine
+	fn := func() error {
+		if r.entity.electionState() != Follower {
+			if args.electionTerm > r.state.currentTerm {
+				r.state.currentTerm = args.electionTerm
+				r.state.votedFor = 0
+				r.entity.stopAndBecome(Follower)
+			}
+			reply.term = r.state.currentTerm
+			reply.voteGranted = false
+			return nil
+		}
+
+		follower := r.entity.(*follower)
+		return follower.requestVote(args, reply)
+	}
+
+	fnHolder := r.queueFunc(fn)
+	err := <-fnHolder.fnResult
+	return err
+}
+
+// Called via RPC
+// We are in rpc goroutine
+func (r *Raft) AppendEntries(args *appendEntriesArgs, reply *appendEntriesReply) error {
+
+	// Stale leader
+	if args.leaderTerm < r.state.currentTerm {
+		reply.success = false
+		return nil
+	}
+
+	if r.entity.electionState() != Follower {
+		r.entity.stopAndBecome(Follower)
+	}
+
+	follower := r.entity.(*follower)
 	return follower.appendEntries(args, reply)
 }
 
 // ========== LEADER ================
 type leader struct {
-	raft      *raft
-	heartbeat time.Duration
-	exit      chan ElectionState
+	raft *Raft
+	exit chan ElectionState
 }
 
-func (l *leader) run() ElectionState {
-	heartbeatTicker := time.NewTicker(time.Duration(150) * time.Millisecond)
+func (l *leader) run() <-chan ElectionState {
+	ch := make(chan ElectionState)
 
-	for {
-		select {
-		case <-heartbeatTicker.C:
-			l.sendHeatbeats()
-		case state := <-l.exit:
-			return state
+	go func() {
+		l.sendHeatbeats()
+
+		heartbeatTicker := time.NewTicker(time.Duration(150) * time.Millisecond)
+		defer heartbeatTicker.Stop()
+		for {
+			select {
+			case <-heartbeatTicker.C:
+				l.sendHeatbeats()
+			case state := <-l.exit:
+				ch <- state
+				return
+			}
 		}
-	}
+	}()
+	return ch
 }
 
-func (c *leader) stop(state ElectionState) {
+func (c *leader) stopAndBecome(state ElectionState) {
 	c.exit <- state
 }
 
@@ -442,7 +398,7 @@ func (l *leader) requestAppendEntries(
 	}
 }
 
-func (l *leader) TryCommand(command interface{}) {
+func (l *leader) TryCommand(command any) {
 	entry := logEntry{
 		term:     l.raft.state.currentTerm,
 		command:  command,
@@ -465,23 +421,94 @@ func (l *leader) electionState() ElectionState {
 
 // ========== CANDIDATE ================
 type candiate struct {
-	raft *raft
+	raft *Raft
 	exit chan ElectionState
 }
 
-func (c *candiate) run() ElectionState {
-	electionTicker := time.NewTicker(getRandElectionTimeout())
-	for {
-		select {
-		case <-electionTicker.C:
-			c.attemptBecomeLeader()
-		case state := <-c.exit:
-			return state
+func (c *candiate) run() <-chan ElectionState {
+	ch := make(chan ElectionState)
+
+	go func() {
+		c.attemptBecomeLeader()
+
+		electionTicker := time.NewTicker(getRandElectionTimeout())
+		defer electionTicker.Stop()
+		for {
+			select {
+			case <-electionTicker.C:
+				c.attemptBecomeLeader()
+			case state := <-c.exit:
+				ch <- state
+				return
+			}
 		}
-	}
+	}()
+	return ch
 }
 
-func (c *candiate) stop(state ElectionState) {
+// Called by a candidate to request votes to become leader
+// Initiates the RPC call to requestVote which runs on a follower.
+// Returns number of votes granted
+func (c *candiate) requestRequestVote(term int, candidateId int, lastLogIndex int, lastLogTerm int) int {
+	args := requestVoteArgs{
+		electionTerm: term,
+		candidateId:  candidateId,
+		lastLogIndex: lastLogIndex,
+		lastLogTerm:  lastLogTerm,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(c.raft.numOfPeers)
+	ch := make(chan (requestVoteReply), c.raft.numOfPeers)
+	defer close(ch)
+
+	// Send requestVote to all clients
+	// Gather num of votes received
+	for i := range c.raft.numOfPeers {
+		go func(index int) {
+			defer wg.Done()
+			reply := requestVoteReply{
+				term:        0,
+				voteGranted: false,
+			}
+			// FIXME - need rpc timeout
+			err := c.raft.rpcClients[index].Call("Raft.RequestVote", args, &reply)
+			if err != nil {
+				fmt.Printf("requestVote error %s", err.Error())
+				return
+			}
+			ch <- reply
+
+		}(i)
+	}
+
+	wg.Wait()
+
+	votes := 0
+	inElection := true
+	for i := 0; i < c.raft.numOfPeers; i++ {
+		reply := <-ch
+		if reply.term > c.raft.state.currentTerm {
+			// Become follower again if behind in term
+			// Continue through all clients in case there is another greater term
+			c.raft.state.currentTerm = reply.term
+			c.raft.state.votedFor = 0
+			c.raft.state.electionState = Follower
+			c.raft.persistState()
+			inElection = false
+		} else if reply.voteGranted {
+			votes += 1
+		}
+	}
+
+	if !inElection {
+		votes = 0
+	}
+
+	return votes
+}
+
+func (c *candiate) stopAndBecome(state ElectionState) {
 	c.exit <- state
 }
 
@@ -490,7 +517,7 @@ func (c *candiate) attemptBecomeLeader() {
 	c.raft.state.votedFor = c.raft.state.id // vote for self
 	c.raft.state.electionState = Candidate
 	c.raft.persistState()
-	votes := c.raft.requestRequestVote(
+	votes := c.requestRequestVote(
 		c.raft.state.currentTerm,
 		c.raft.state.id,
 		c.raft.state.lastApplied,
@@ -503,7 +530,7 @@ func (c *candiate) attemptBecomeLeader() {
 		for i := range c.raft.state.nextindex {
 			c.raft.state.nextindex[i] = c.raft.state.log.lastIndex() + 1
 		}
-		c.stop(Leader)
+		c.stopAndBecome(Leader)
 	}
 }
 
@@ -513,61 +540,67 @@ func (c *candiate) electionState() ElectionState {
 
 // ========== FOLLOWER ================
 type follower struct {
-	raft *raft
+	raft *Raft
 	exit chan ElectionState
 }
 
-func (f *follower) run() ElectionState {
-	electionTicker := time.NewTicker(getRandElectionTimeout())
-	for {
-		select {
-		case <-electionTicker.C:
-			f.attemptBecomeLeader()
-		case state := <-f.exit:
-			return state
+func (f *follower) run() <-chan ElectionState {
+	ch := make(chan ElectionState)
+
+	go func() {
+		electionTicker := time.NewTicker(getRandElectionTimeout())
+		defer electionTicker.Stop()
+		for {
+			select {
+			case <-electionTicker.C:
+				f.stopAndBecome(Candidate)
+			case state := <-f.exit:
+				ch <- state
+				return
+			}
 		}
-	}
+	}()
+	return ch
 }
 
-func (f *follower) stop(state ElectionState) {
-	f.exit <- state
-}
-
-func (f *follower) attemptBecomeLeader() {
-	if f.raft.state.votedFor != 0 {
-		return
+// Received by other nodes to respond to requests to become leader
+// Not called directly. Only called via RPC
+func (f *follower) requestVote(args *requestVoteArgs, reply *requestVoteReply) error {
+	if args.electionTerm < f.raft.state.currentTerm {
+		// If our term is greater than the term of the request, update the requesters term and vote no.
+		reply.term = f.raft.state.currentTerm
+		reply.voteGranted = false
+		return nil
+	}
+	// Requester is in a higher term than us, reset our vote
+	if args.electionTerm > f.raft.state.currentTerm {
+		f.raft.state.currentTerm = args.electionTerm
+		f.raft.state.votedFor = 0
 	}
 
-	f.raft.state.currentTerm += 1           // Begin new election term
-	f.raft.state.votedFor = f.raft.state.id // vote for self
-	f.raft.state.electionState = Candidate
-	f.raft.persistState()
-	votes := f.raft.requestRequestVote(
-		f.raft.state.currentTerm,
-		f.raft.state.id,
-		f.raft.state.lastApplied,
-		f.raft.state.log.lastTerm(),
-	)
-	if votes > f.raft.numOfPeers/2-1 {
-		// Election won, become leader
-		f.raft.state.electionState = Leader
+	reply.term = f.raft.state.currentTerm
+
+	newLogUpToDate := false
+	if args.lastLogTerm > f.raft.state.log.lastTerm() {
+		newLogUpToDate = true
+	} else if args.lastLogTerm == f.raft.state.log.lastTerm() &&
+		args.lastLogIndex >= f.raft.state.log.lastIndex() {
+		newLogUpToDate = true
+	}
+
+	// Otherwise grant vote if not yet voted in this term or if already voted for candidate
+	if (f.raft.state.votedFor == 0 || f.raft.state.votedFor == args.candidateId) && newLogUpToDate {
+		f.raft.state.votedFor = args.candidateId
 		f.raft.persistState()
-		for i := range f.raft.state.nextindex {
-			f.raft.state.nextindex[i] = f.raft.state.log.lastIndex() + 1
-		}
-		//f.raft.sendHeatbeats()
-		f.stop(Leader)
+		reply.voteGranted = true
+	} else {
+		reply.voteGranted = false
 	}
+	return nil
 }
 
 func (f *follower) appendEntries(args *appendEntriesArgs, reply *appendEntriesReply) error {
 	reply.term = f.raft.state.currentTerm
-
-	// Stale leader
-	if args.leaderTerm < f.raft.state.currentTerm {
-		reply.success = false
-		return nil
-	}
 
 	f.raft.state.electionReset <- true
 	f.raft.state.electionState = Follower
@@ -587,7 +620,7 @@ func (f *follower) appendEntries(args *appendEntriesArgs, reply *appendEntriesRe
 	// delete all existing entries after the first bad one
 	curLastIndex := f.raft.state.log.lastIndex()
 	amountToCheck := min(len(args.entries), curLastIndex-args.prevLogIndex)
-	for i := 0; i < amountToCheck; i++ {
+	for i := range amountToCheck {
 		checkIndex := args.prevLogIndex + i + 1
 		newEntryTerm := args.entries[i]
 		curEntryTerm := f.raft.state.log.entries[checkIndex]
@@ -605,6 +638,10 @@ func (f *follower) appendEntries(args *appendEntriesArgs, reply *appendEntriesRe
 	f.raft.persistState()
 	reply.success = true
 	return nil
+}
+
+func (f *follower) stopAndBecome(state ElectionState) {
+	f.exit <- state
 }
 
 func (f *follower) electionState() ElectionState {
